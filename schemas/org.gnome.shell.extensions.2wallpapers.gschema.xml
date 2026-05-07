@@ -11,5 +11,15 @@
       <summary>Wallpaper URI when visible windows are open</summary>
       <description>The file URI for the wallpaper to use when one or more visible windows are open.</description>
     </key>
+    <key name="grid-width" type="i">
+      <default>8</default>
+      <summary>Grid Width for Window Coverage</summary>
+      <description>Number of horizontal sensors for calculating window coverage.</description>
+    </key>
+    <key name="grid-height" type="i">
+      <default>4</default>
+      <summary>Grid Height for Window Coverage</summary>
+      <description>Number of vertical sensors for calculating window coverage.</description>
+    </key>
   </schema>
 </schemalist>

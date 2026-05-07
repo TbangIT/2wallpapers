@@ -77,6 +77,30 @@ export default class TwoWallpapersPreferences extends ExtensionPreferences {
         // Wallpaper com janelas
         createChooserButton('wallpaper-with-windows', 'With Windows Wallpaper');
 
+        const createSpinButton = (key, title, subtitle, min, max) => {
+            const row = new Adw.ActionRow({ title, subtitle });
+
+            const spinButton = new Gtk.SpinButton({
+                valign: Gtk.Align.CENTER,
+                adjustment: new Gtk.Adjustment({
+                    lower: min,
+                    upper: max,
+                    step_increment: 1
+                })
+            });
+
+            spinButton.set_value(settings.get_int(key));
+            spinButton.connect('value-changed', () => {
+                settings.set_int(key, spinButton.get_value_as_int());
+            });
+
+            row.add_suffix(spinButton);
+            group.add(row);
+        };
+
+        createSpinButton('grid-width', 'Grid Width', 'Number of horizontal sensors', 1, 32);
+        createSpinButton('grid-height', 'Grid Height', 'Number of vertical sensors', 1, 32);
+
         window.add(page);
     }
 }

@@ -1,165 +1,299 @@
-import Meta from 'gi://Meta';
+import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
+import St from 'gi://St';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
-/**
- * Adding comments for easing revision as still learning, and may help someone later if
- * i abandon this project
- *
- */
 export default class TwoWallpapersExtension extends Extension {
     constructor(metadata) {
         super(metadata);
-        // Extension settings containing wallpaper URIs
         this._settings = null;
-        // GNOME workspace manager reference
         this._wm = global.workspace_manager;
-        // Currently active workspace
-        this._currentWs = null;
-        // Map to store window signal connection IDs for cleanup
-        this._connIds = new Map();
-        // Signal ID for workspace switching events
-        this._wsSwitchedId = null;
-        // Signal ID for window-added events
-        this._windowAddedId = null;
-        // Signal ID for window-removed events
-        this._windowRemovedId = null;
+
+        // Background actors for each monitor
+        this._bgActors = [];
+
+        // Keep track of all window added/removed connections globally
+        this._workspaceSignals = new Map();
+
+        // Keep track of our custom dark backgrounds for windows
+        this._windowBackgrounds = new Map();
+
+        // Track window visibility changes
+        this._windowSignals = new Map();
+
+        this._bgChangedId = null;
     }
 
-    /**
-     * Updates the desktop background based on visible window count.
-     * Uses 'wallpaper-no-windows' when workspace is empty,
-     * otherwise uses 'wallpaper-with-windows'.
-     */
-    _updateBackground() {
-        if (!this._currentWs) return;
+    _createBgActor(monitorIndex, uri) {
+        let monitor = Main.layoutManager.monitors[monitorIndex];
+        let actor = new St.Widget({
+            style: `background-image: url("${uri}"); background-size: cover; background-position: center;`,
+            x: monitor.x,
+            y: monitor.y,
+            width: monitor.width,
+            height: monitor.height,
+            opacity: 0 // Start hidden
+        });
+        return actor;
+    }
 
-        // Get all windows in the current workspace
-        const windows = this._currentWs.list_windows();
-        // Count only visible windows (not minimized, not hidden from taskbar)
-        const visibleCount = windows.filter(w => !w.minimized && !w.skip_taskbar).length;
+    _setupBackgroundActors() {
+        this._removeBackgroundActors();
 
-        // Select appropriate wallpaper based on visible window count
-        let uri = '';
-        if (visibleCount === 0) {
-            uri = this._settings.get_string('wallpaper-no-windows');
+        let uri = this._settings.get_string('wallpaper-with-windows');
+        if (!uri) return;
+
+        // Handle file:// prefix if needed or standard path
+        let formattedUri = uri.startsWith('file://') ? uri : `file://${uri}`;
+
+        for (let i = 0; i < Main.layoutManager.monitors.length; i++) {
+            let actor = this._createBgActor(i, formattedUri);
+            // Add to background group so it's behind everything
+            Main.layoutManager._backgroundGroup.add_child(actor);
+            this._bgActors.push(actor);
+        }
+    }
+
+    _removeBackgroundActors() {
+        for (let actor of this._bgActors) {
+            actor.destroy();
+        }
+        this._bgActors = [];
+    }
+
+    _addWindowBackground(window) {
+        if (!window || this._windowBackgrounds.has(window)) return;
+
+        let windowActor = window.get_compositor_private();
+        if (!windowActor) return;
+
+        // Create dark gray background rect, completely opaque
+        let bgActor = new Clutter.Actor({
+            background_color: new Clutter.Color({ red: 30, green: 30, blue: 30, alpha: 255 }),
+            opacity: 0 // Start hidden
+        });
+
+        // Instead of directly inside windowActor, put it inside windowGroup
+        // to avoid issues with window texture/surface completely covering or hiding it.
+        // We put it below the window actor itself.
+        let windowGroup = windowActor.get_parent();
+        if (windowGroup) {
+            windowGroup.insert_child_below(bgActor, windowActor);
         } else {
-            uri = this._settings.get_string('wallpaper-with-windows');
+            // Fallback if not added to group yet
+            windowActor.insert_child_at_index(bgActor, 0);
         }
 
-        // Apply wallpaper to both light and dark modes
-        if (uri) {
-            this._backgroundSettings.set_string('picture-uri', uri);
-            this._backgroundSettings.set_string('picture-uri-dark', uri);
-        }
+        // Bind size and position to the window actor tightly
+        bgActor.add_constraint(new Clutter.BindConstraint({ source: windowActor, coordinate: Clutter.BindCoordinate.POSITION }));
+        bgActor.add_constraint(new Clutter.BindConstraint({ source: windowActor, coordinate: Clutter.BindCoordinate.SIZE }));
+
+        this._windowBackgrounds.set(window, bgActor);
     }
 
-    /**
-     * Connects to minimize/restore signals for all existing windows
-     * in the current workspace. This ensures background updates when
-     * windows are minimized or restored.
-     */
-    _connectToCurrentWindows() {
-        const windows = this._currentWs.list_windows();
-        for (let w of windows) {
-            // Listen for window minimize/restore events
-            const id = w.connect('notify::minimized', this._updateBackground.bind(this));
-            // Store connection ID for later cleanup
-            this._connIds.set(w, id);
+    _removeWindowBackground(window) {
+        let bgActor = this._windowBackgrounds.get(window);
+        if (bgActor) {
+            bgActor.destroy();
+            this._windowBackgrounds.delete(window);
         }
     }
 
-    /**
-     * Disconnects all window signals and clears the connection map.
-     * Called when switching workspaces or disabling the extension.
-     */
-    _disconnectFromCurrentWindows() {
-        for (let [w, id] of this._connIds) {
-            if (w) w.disconnect(id);
+    _isWorkspaceCovered(workspace) {
+        let monitor = Main.layoutManager.primaryMonitor;
+        if (!monitor) return false;
+
+        let gridW = this._settings ? this._settings.get_int('grid-width') : 8;
+        let gridH = this._settings ? this._settings.get_int('grid-height') : 4;
+
+        // Safety bounds
+        if (gridW <= 0) gridW = 8;
+        if (gridH <= 0) gridH = 4;
+
+        let cellW = monitor.width / gridW;
+        let cellH = monitor.height / gridH;
+
+        let coveredCells = 0;
+        let totalCells = gridW * gridH;
+
+        const windows = workspace.list_windows().filter(w => w.showing_on_its_workspace() && !w.minimized && !w.skip_taskbar);
+
+        if (windows.length === 0) return false;
+
+        for (let x = 0; x < gridW; x++) {
+            for (let y = 0; y < gridH; y++) {
+                let cx = monitor.x + (x * cellW) + (cellW / 2);
+                let cy = monitor.y + (y * cellH) + (cellH / 2);
+
+                // Check if any visible window covers this center point
+                let isCovered = windows.some(w => {
+                    let rect = w.get_frame_rect();
+                    return cx >= rect.x && cx <= (rect.x + rect.width) &&
+                           cy >= rect.y && cy <= (rect.y + rect.height);
+                });
+
+                if (isCovered) coveredCells++;
+            }
         }
-        this._connIds.clear();
+
+        // 60% coverage threshold
+        return (coveredCells / totalCells) >= 0.6;
     }
 
-    /**
-     * Sets up signal listeners for window-added and window-removed events
-     * in the current workspace. This tracks when windows are opened or closed.
-     */
-    _connectSignals() {
-        // Handle new windows being opened
-        this._windowAddedId = this._currentWs.connect('window-added', (ws, w) => {
-            // Connect to the new window's minimize signal
-            const id = w.connect('notify::minimized', this._updateBackground.bind(this));
-            this._connIds.set(w, id);
-            // Update background immediately (new window is now visible)
-            this._updateBackground();
-        });
+    _updateState() {
+        let activeWs = this._wm.get_active_workspace();
 
-        // Handle windows being closed
-        this._windowRemovedId = this._currentWs.connect('window-removed', (ws, w) => {
-            // Disconnect the window's minimize signal
-            const id = this._connIds.get(w);
-            if (id && w) w.disconnect(id);
-            this._connIds.delete(w);
-            // Update background immediately (one less visible window)
-            this._updateBackground();
-        });
+        // 1. Check all workspaces to set window backgrounds
+        for (let i = 0; i < this._wm.n_workspaces; i++) {
+            let ws = this._wm.get_workspace_by_index(i);
+            let isActive = (ws === activeWs);
+
+            let isCovered = false;
+            if (isActive) {
+                isCovered = this._isWorkspaceCovered(ws);
+            }
+
+            let windows = ws.list_windows();
+            for (let w of windows) {
+                let bgActor = this._windowBackgrounds.get(w);
+                if (bgActor) {
+                    // Logic:
+                    // If workspace is NOT active -> solid (opacity 255)
+                    // If workspace IS active:
+                    //   - If covered (conditions met) -> solid removed (opacity 0)
+                    //   - If NOT covered -> solid (opacity 255)
+
+                    let targetOpacity = (!isActive || !isCovered) ? 255 : 0;
+
+                    bgActor.ease({
+                        opacity: targetOpacity,
+                        duration: 300,
+                        mode: Clutter.AnimationMode.EASE_OUT_QUAD
+                    });
+                }
+            }
+        }
+
+        // 2. Update background actors opacity based on active workspace coverage
+        let isActiveCovered = this._isWorkspaceCovered(activeWs);
+        let bgTargetOpacity = isActiveCovered ? 255 : 0;
+
+        for (let bgActor of this._bgActors) {
+            bgActor.ease({
+                opacity: bgTargetOpacity,
+                duration: 300,
+                mode: Clutter.AnimationMode.EASE_OUT_QUAD
+            });
+        }
     }
 
-    /**
-     * Called when the extension is enabled.
-     * Initializes settings, connects all signals, and sets initial wallpaper.
-     */
-enable() {
-    // Access GNOME's background settings
-    // Added delay to prevent conflicst at startup - setTimeout as sugested by user @internauta2000
-    setTimeout(() => {
-    this._backgroundSettings = new Gio.Settings({ schema_id: 'org.gnome.desktop.background' });
-    // Load extension's custom settings
-    this._settings = this.getSettings();
-    // Get the currently active workspace
-    this._currentWs = this._wm.get_active_workspace();
-    // Set up window monitoring for current workspace
-    this._connectSignals();
-    // Connect to existing windows in the workspace
-    this._connectToCurrentWindows();
-    // Apply initial wallpaper
-    this._updateBackground();
+    _onWindowAdded(ws, window) {
+        this._addWindowBackground(window);
 
-    // Handle workspace switching
-    this._wsSwitchedId = this._wm.connect('workspace-switched', () => {
-        // Clean up connections from previous workspace
-        this._disconnectFromCurrentWindows();
-        this._currentWs.disconnect(this._windowAddedId);
-        this._currentWs.disconnect(this._windowRemovedId);
-        // Switch to new workspace and reconnect everything
-        this._currentWs = this._wm.get_active_workspace();
-        this._connectSignals();
-        this._connectToCurrentWindows();
-        // Update wallpaper for new workspace
-        this._updateBackground();
-    });
-                 }, 5000)
-}
+        let signals = [];
+        signals.push(window.connect('notify::minimized', () => this._updateState()));
+        signals.push(window.connect('size-changed', () => this._updateState()));
+        signals.push(window.connect('position-changed', () => this._updateState()));
+        this._windowSignals.set(window, signals);
 
-    /**
-     * Called when the extension is disabled.
-     * Disconnects all signals and cleans up references to prevent memory leaks.
-     */
+        this._updateState();
+    }
+
+    _onWindowRemoved(ws, window) {
+        this._removeWindowBackground(window);
+
+        let signals = this._windowSignals.get(window);
+        if (signals && window) {
+            signals.forEach(id => window.disconnect(id));
+        }
+        this._windowSignals.delete(window);
+
+        this._updateState();
+    }
+
+    _setupWorkspaceSignals() {
+        for (let i = 0; i < this._wm.n_workspaces; i++) {
+            let ws = this._wm.get_workspace_by_index(i);
+            if (!this._workspaceSignals.has(ws)) {
+                let addedId = ws.connect('window-added', this._onWindowAdded.bind(this));
+                let removedId = ws.connect('window-removed', this._onWindowRemoved.bind(this));
+                this._workspaceSignals.set(ws, {addedId, removedId});
+
+                // Add existing windows
+                for (let w of ws.list_windows()) {
+                    this._onWindowAdded(ws, w);
+                }
+            }
+        }
+    }
+
+    _cleanupWorkspaceSignals() {
+        for (let [ws, signals] of this._workspaceSignals.entries()) {
+            if (ws) {
+                ws.disconnect(signals.addedId);
+                ws.disconnect(signals.removedId);
+            }
+        }
+        this._workspaceSignals.clear();
+
+        for (let [w, signals] of this._windowSignals.entries()) {
+            if (w) {
+                signals.forEach(id => w.disconnect(id));
+            }
+            this._removeWindowBackground(w);
+        }
+        this._windowSignals.clear();
+    }
+
+    enable() {
+        this._startupTimeoutId = setTimeout(() => {
+            this._settings = this.getSettings();
+
+            // Set basic wallpaper immediately using settings so it's loaded by gnome
+            let noWinUri = this._settings.get_string('wallpaper-no-windows');
+            if (noWinUri) {
+                let bgSettings = new Gio.Settings({ schema_id: 'org.gnome.desktop.background' });
+                bgSettings.set_string('picture-uri', noWinUri);
+                bgSettings.set_string('picture-uri-dark', noWinUri);
+            }
+
+            this._setupBackgroundActors();
+            this._setupWorkspaceSignals();
+
+            this._wsSwitchedId = this._wm.connect('workspace-switched', () => this._updateState());
+            this._wsAddedId = this._wm.connect('workspace-added', () => this._setupWorkspaceSignals());
+
+            this._bgChangedId = this._settings.connect('changed::wallpaper-with-windows', () => {
+                this._setupBackgroundActors();
+                this._updateState();
+            });
+
+            this._updateState();
+        }, 500);
+    }
+
     disable() {
-        // Disconnect workspace switching listener
-        if (this._wsSwitchedId) this._wm.disconnect(this._wsSwitchedId);
-        // Disconnect window monitoring signals
-        if (this._windowAddedId) this._currentWs.disconnect(this._windowAddedId);
-        if (this._windowRemovedId) this._currentWs.disconnect(this._windowRemovedId);
-        // Disconnect all window minimize/restore signals
-        this._disconnectFromCurrentWindows();
-        // Clear the connection map (keeps Map instance to avoid race conditions)
-        this._connIds.clear();
-        // Remember, this is a map, nulling it may prevent been used later.
-        // Causing "TypeError: can't access property "set", this._connIds is null" error
-        this._currentWs = null;
+        if (this._startupTimeoutId) {
+            clearTimeout(this._startupTimeoutId);
+            this._startupTimeoutId = null;
+        }
+
+        if (this._wsSwitchedId) {
+            this._wm.disconnect(this._wsSwitchedId);
+            this._wsSwitchedId = null;
+        }
+        if (this._wsAddedId) {
+            this._wm.disconnect(this._wsAddedId);
+            this._wsAddedId = null;
+        }
+        if (this._bgChangedId && this._settings) {
+            this._settings.disconnect(this._bgChangedId);
+            this._bgChangedId = null;
+        }
+
+        this._cleanupWorkspaceSignals();
+        this._removeBackgroundActors();
         this._settings = null;
-        this._backgroundSettings = null;
     }
 }
