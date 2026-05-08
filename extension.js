@@ -164,19 +164,18 @@ export default class TwoWallpapersExtension extends Extension {
 
         clipActor.add_child(clone);
 
-        let windowGroup = windowActor.get_parent();
-        if (windowGroup) {
-            windowGroup.insert_child_below(clipActor, windowActor);
-        } else {
-            windowActor.insert_child_at_index(clipActor, 0);
-        }
+        // Inject exactly like blur-my-shell to avoid compositor breaking:
+        // as the first child of the window actor.
+        windowActor.insert_child_at_index(clipActor, 0);
 
-        // Keep the clipActor matching the size and position of the window
-        clipActor.add_constraint(new Clutter.BindConstraint({ source: windowActor, coordinate: Clutter.BindCoordinate.POSITION }));
+        // Since clipActor is a child of windowActor, its coordinate space is relative to the window.
+        // We just bind its size to the window actor. We do NOT bind position, as that would shift it
+        // outside the bounds.
         clipActor.add_constraint(new Clutter.BindConstraint({ source: windowActor, coordinate: Clutter.BindCoordinate.SIZE }));
+        clipActor.set_position(0, 0);
 
-        // We must translate the clone backwards by the window's position so the desktop aligns perfectly.
-        // E.g., if window is at (100, 100), the clone of the desktop must be drawn at (-100, -100) inside the clip.
+        // We must translate the clone backwards by the window's absolute position on screen
+        // so the desktop clone aligns perfectly with the real desktop.
         // We use the buffer_rect to better align with the bounds used by the compositor for the windowActor.
         let updateCloneOffset = () => {
             let rect = window.get_buffer_rect();
