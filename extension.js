@@ -1,4 +1,5 @@
 import Clutter from 'gi://Clutter';
+import Meta from 'gi://Meta';
 import Gio from 'gi://Gio';
 import St from 'gi://St';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
@@ -15,9 +16,6 @@ export default class TwoWallpapersExtension extends Extension {
 
         // Keep track of all window added/removed connections globally
         this._workspaceSignals = new Map();
-
-        // Keep track of our custom dark backgrounds for windows
-        this._windowBackgrounds = new Map();
 
         // Track window visibility changes
         this._windowSignals = new Map();
@@ -62,44 +60,6 @@ export default class TwoWallpapersExtension extends Extension {
         this._bgActors = [];
     }
 
-    _addWindowBackground(window) {
-        if (!window || this._windowBackgrounds.has(window)) return;
-
-        let windowActor = window.get_compositor_private();
-        if (!windowActor) return;
-
-        // Create dark gray background rect, completely opaque
-        let bgActor = new Clutter.Actor({
-            background_color: new Clutter.Color({ red: 30, green: 30, blue: 30, alpha: 255 }),
-            opacity: 0 // Start hidden
-        });
-
-        // Instead of directly inside windowActor, put it inside windowGroup
-        // to avoid issues with window texture/surface completely covering or hiding it.
-        // We put it below the window actor itself.
-        let windowGroup = windowActor.get_parent();
-        if (windowGroup) {
-            windowGroup.insert_child_below(bgActor, windowActor);
-        } else {
-            // Fallback if not added to group yet
-            windowActor.insert_child_at_index(bgActor, 0);
-        }
-
-        // Bind size and position to the window actor tightly
-        bgActor.add_constraint(new Clutter.BindConstraint({ source: windowActor, coordinate: Clutter.BindCoordinate.POSITION }));
-        bgActor.add_constraint(new Clutter.BindConstraint({ source: windowActor, coordinate: Clutter.BindCoordinate.SIZE }));
-
-        this._windowBackgrounds.set(window, bgActor);
-    }
-
-    _removeWindowBackground(window) {
-        let bgActor = this._windowBackgrounds.get(window);
-        if (bgActor) {
-            bgActor.destroy();
-            this._windowBackgrounds.delete(window);
-        }
-    }
-
     _isWorkspaceCovered(workspace) {
         let monitor = Main.layoutManager.primaryMonitor;
         if (!monitor) return false;
@@ -117,7 +77,13 @@ export default class TwoWallpapersExtension extends Extension {
         let coveredCells = 0;
         let totalCells = gridW * gridH;
 
-        const windows = workspace.list_windows().filter(w => w.showing_on_its_workspace() && !w.minimized && !w.skip_taskbar);
+        // Filter out minimized, utility, desktop, dock, or hidden windows
+        const windows = workspace.list_windows().filter(w => {
+            return w.showing_on_its_workspace() &&
+                   !w.minimized &&
+                   !w.skip_taskbar &&
+                   w.window_type === Meta.WindowType.NORMAL;
+        });
 
         if (windows.length === 0) return false;
 
@@ -128,9 +94,18 @@ export default class TwoWallpapersExtension extends Extension {
 
                 // Check if any visible window covers this center point
                 let isCovered = windows.some(w => {
-                    let rect = w.get_frame_rect();
-                    return cx >= rect.x && cx <= (rect.x + rect.width) &&
-                           cy >= rect.y && cy <= (rect.y + rect.height);
+                    let frameRect = w.get_frame_rect();
+                    let bufferRect = w.get_buffer_rect();
+
+                    // XWayland apps like Microsoft Edge sometimes have weird frame rects vs buffer rects
+                    // We check if the point falls inside the buffer rect OR the frame rect
+                    let inFrame = cx >= frameRect.x && cx <= (frameRect.x + frameRect.width) &&
+                                  cy >= frameRect.y && cy <= (frameRect.y + frameRect.height);
+
+                    let inBuffer = cx >= bufferRect.x && cx <= (bufferRect.x + bufferRect.width) &&
+                                   cy >= bufferRect.y && cy <= (bufferRect.y + bufferRect.height);
+
+                    return inFrame || inBuffer;
                 });
 
                 if (isCovered) coveredCells++;
@@ -144,38 +119,7 @@ export default class TwoWallpapersExtension extends Extension {
     _updateState() {
         let activeWs = this._wm.get_active_workspace();
 
-        // 1. Check all workspaces to set window backgrounds
-        for (let i = 0; i < this._wm.n_workspaces; i++) {
-            let ws = this._wm.get_workspace_by_index(i);
-            let isActive = (ws === activeWs);
-
-            let isCovered = false;
-            if (isActive) {
-                isCovered = this._isWorkspaceCovered(ws);
-            }
-
-            let windows = ws.list_windows();
-            for (let w of windows) {
-                let bgActor = this._windowBackgrounds.get(w);
-                if (bgActor) {
-                    // Logic:
-                    // If workspace is NOT active -> solid (opacity 255)
-                    // If workspace IS active:
-                    //   - If covered (conditions met) -> solid removed (opacity 0)
-                    //   - If NOT covered -> solid (opacity 255)
-
-                    let targetOpacity = (!isActive || !isCovered) ? 255 : 0;
-
-                    bgActor.ease({
-                        opacity: targetOpacity,
-                        duration: 300,
-                        mode: Clutter.AnimationMode.EASE_OUT_QUAD
-                    });
-                }
-            }
-        }
-
-        // 2. Update background actors opacity based on active workspace coverage
+        // Update background actors opacity based on active workspace coverage
         let isActiveCovered = this._isWorkspaceCovered(activeWs);
         let bgTargetOpacity = isActiveCovered ? 255 : 0;
 
@@ -189,8 +133,6 @@ export default class TwoWallpapersExtension extends Extension {
     }
 
     _onWindowAdded(ws, window) {
-        this._addWindowBackground(window);
-
         let signals = [];
         signals.push(window.connect('notify::minimized', () => this._updateState()));
         signals.push(window.connect('size-changed', () => this._updateState()));
@@ -201,8 +143,6 @@ export default class TwoWallpapersExtension extends Extension {
     }
 
     _onWindowRemoved(ws, window) {
-        this._removeWindowBackground(window);
-
         let signals = this._windowSignals.get(window);
         if (signals && window) {
             signals.forEach(id => window.disconnect(id));
@@ -241,9 +181,14 @@ export default class TwoWallpapersExtension extends Extension {
             if (w) {
                 signals.forEach(id => w.disconnect(id));
             }
-            this._removeWindowBackground(w);
         }
         this._windowSignals.clear();
+    }
+
+    _onMonitorsChanged() {
+        // When screen wakes up from sleep/lock, monitors can be rebuilt
+        this._setupBackgroundActors();
+        this._updateState();
     }
 
     enable() {
@@ -269,6 +214,8 @@ export default class TwoWallpapersExtension extends Extension {
                 this._updateState();
             });
 
+            this._monitorsChangedId = Main.layoutManager.connect('monitors-changed', this._onMonitorsChanged.bind(this));
+
             this._updateState();
         }, 500);
     }
@@ -290,6 +237,10 @@ export default class TwoWallpapersExtension extends Extension {
         if (this._bgChangedId && this._settings) {
             this._settings.disconnect(this._bgChangedId);
             this._bgChangedId = null;
+        }
+        if (this._monitorsChangedId) {
+            Main.layoutManager.disconnect(this._monitorsChangedId);
+            this._monitorsChangedId = null;
         }
 
         this._cleanupWorkspaceSignals();
