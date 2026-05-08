@@ -1,6 +1,7 @@
 import Clutter from 'gi://Clutter';
 import Meta from 'gi://Meta';
 import Gio from 'gi://Gio';
+import GLib from 'gi://GLib';
 import St from 'gi://St';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
@@ -16,6 +17,9 @@ export default class TwoWallpapersExtension extends Extension {
 
         // Keep track of all window added/removed connections globally
         this._workspaceSignals = new Map();
+
+        // Background clones inserted under windows
+        this._windowBackgroundClones = new Map();
 
         // Track window visibility changes
         this._windowSignals = new Map();
@@ -61,23 +65,18 @@ export default class TwoWallpapersExtension extends Extension {
     }
 
     _isWorkspaceCovered(workspace) {
-        let monitor = Main.layoutManager.primaryMonitor;
+        // 8x4 Grid calculation
+        let monitor = Main.layoutManager.primaryMonitor; // Simplification: mostly checking primary monitor
         if (!monitor) return false;
 
-        let gridW = this._settings ? this._settings.get_int('grid-width') : 8;
-        let gridH = this._settings ? this._settings.get_int('grid-height') : 4;
-
-        // Safety bounds
-        if (gridW <= 0) gridW = 8;
-        if (gridH <= 0) gridH = 4;
-
+        let gridW = 8;
+        let gridH = 4;
         let cellW = monitor.width / gridW;
         let cellH = monitor.height / gridH;
 
         let coveredCells = 0;
         let totalCells = gridW * gridH;
 
-        // Filter out minimized, utility, desktop, dock, or hidden windows
         const windows = workspace.list_windows().filter(w => {
             return w.showing_on_its_workspace() &&
                    !w.minimized &&
@@ -97,8 +96,6 @@ export default class TwoWallpapersExtension extends Extension {
                     let frameRect = w.get_frame_rect();
                     let bufferRect = w.get_buffer_rect();
 
-                    // XWayland apps like Microsoft Edge sometimes have weird frame rects vs buffer rects
-                    // We check if the point falls inside the buffer rect OR the frame rect
                     let inFrame = cx >= frameRect.x && cx <= (frameRect.x + frameRect.width) &&
                                   cy >= frameRect.y && cy <= (frameRect.y + frameRect.height);
 
@@ -130,19 +127,100 @@ export default class TwoWallpapersExtension extends Extension {
                 mode: Clutter.AnimationMode.EASE_OUT_QUAD
             });
         }
+
+        // Also fade out/in the window background clones
+        // If the screen IS covered, the user doesn't want the desktop to bleed through windows
+        // Wait, the user wants the desktop background ALWAYS under the window, no matter what?
+        // "solo mostrare sempre lo sfondo del desktop sotto di lei"
+        // Yes, always show the normal desktop under the window so it hides other windows.
+        // Wait, if the background actors (which are the BLURRED wallpaper) are active, does the clone show the blurred wallpaper or the normal one?
+        // The clone is of `Main.layoutManager._backgroundGroup`, which *contains* our blurred actors!
+        // So the clone naturally inherits whatever the desktop currently looks like, which is exactly correct!
+    }
+
+    _addWindowBackgroundClone(window) {
+        if (!window || this._windowBackgroundClones.has(window)) return;
+
+        let windowActor = window.get_compositor_private();
+        if (!windowActor) return;
+
+        // Blur-my-shell uses a Clutter.Clone of the background group cropped to the window.
+        // We will create a clone of the system background.
+        let bgGroup = Main.layoutManager._backgroundGroup;
+        if (!bgGroup) return;
+
+        let clone = new Clutter.Clone({
+            source: bgGroup,
+            opacity: 255
+        });
+
+        // The clone needs to be shifted so that it displays the correct part of the desktop
+        // underneath the window. However, a simpler approach is placing a solid black or dark actor
+        // with the background wallpaper, or just letting the clone sit mapped.
+        // We can simply bind it to the window actor and use a Clutter.Actor to clip it.
+        let clipActor = new Clutter.Actor({
+            clip_to_allocation: true,
+        });
+
+        clipActor.add_child(clone);
+
+        let windowGroup = windowActor.get_parent();
+        if (windowGroup) {
+            windowGroup.insert_child_below(clipActor, windowActor);
+        } else {
+            windowActor.insert_child_at_index(clipActor, 0);
+        }
+
+        // Keep the clipActor matching the size and position of the window
+        clipActor.add_constraint(new Clutter.BindConstraint({ source: windowActor, coordinate: Clutter.BindCoordinate.POSITION }));
+        clipActor.add_constraint(new Clutter.BindConstraint({ source: windowActor, coordinate: Clutter.BindCoordinate.SIZE }));
+
+        // We must translate the clone backwards by the window's position so the desktop aligns perfectly.
+        // E.g., if window is at (100, 100), the clone of the desktop must be drawn at (-100, -100) inside the clip.
+        // We use the buffer_rect to better align with the bounds used by the compositor for the windowActor.
+        let updateCloneOffset = () => {
+            let rect = window.get_buffer_rect();
+            clone.set_position(-rect.x, -rect.y);
+        };
+
+        updateCloneOffset();
+
+        this._windowBackgroundClones.set(window, { clipActor, updateCloneOffset });
+    }
+
+    _removeWindowBackgroundClone(window) {
+        let data = this._windowBackgroundClones.get(window);
+        if (data) {
+            data.clipActor.destroy();
+            this._windowBackgroundClones.delete(window);
+        }
     }
 
     _onWindowAdded(ws, window) {
+        this._addWindowBackgroundClone(window);
+
         let signals = [];
-        signals.push(window.connect('notify::minimized', () => this._updateState()));
-        signals.push(window.connect('size-changed', () => this._updateState()));
-        signals.push(window.connect('position-changed', () => this._updateState()));
+        signals.push(window.connect('notify::minimized', () => {
+            this._updateState();
+        }));
+        signals.push(window.connect('size-changed', () => {
+            let data = this._windowBackgroundClones.get(window);
+            if (data) data.updateCloneOffset();
+            this._updateState();
+        }));
+        signals.push(window.connect('position-changed', () => {
+            let data = this._windowBackgroundClones.get(window);
+            if (data) data.updateCloneOffset();
+            this._updateState();
+        }));
         this._windowSignals.set(window, signals);
 
         this._updateState();
     }
 
     _onWindowRemoved(ws, window) {
+        this._removeWindowBackgroundClone(window);
+
         let signals = this._windowSignals.get(window);
         if (signals && window) {
             signals.forEach(id => window.disconnect(id));
@@ -181,6 +259,7 @@ export default class TwoWallpapersExtension extends Extension {
             if (w) {
                 signals.forEach(id => w.disconnect(id));
             }
+            this._removeWindowBackgroundClone(w);
         }
         this._windowSignals.clear();
     }
